@@ -35,6 +35,10 @@ kernels = ["triton", "flash-linear-attention", "nvidia-cudnn-frontend"]
 rollout = ["vllm"]
 test = ["pytest"]
 
+# verl loads every "verl.plugins" entry point when it is imported.
+[project.entry-points."verl.plugins"]
+thundersync = "thundersync.integrations.verl"
+
 [tool.setuptools.dynamic]
 version = { attr = "thundersync.__version__" }
 
