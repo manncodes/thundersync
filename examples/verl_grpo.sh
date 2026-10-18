@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# GRPO on GSM8K: verl generates, ThunderSync streams the backward.
+# GRPO on GSM8K: verl generates, ThunderSync's engine streams the backward.
 #
 # One node: TRAIN_GPUS train while ROLLOUT_GPUS generate. Needs CUDA, Python
 # 3.12, and verl (with vLLM and TransferQueue) with ThunderSync installed after
@@ -35,6 +35,10 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor._target_=thundersync.integrations.verl.engine.ThunderSyncActorConfig \
     actor_rollout_ref.actor.strategy=thundersync \
     +actor_rollout_ref.actor.thundersync.max_concurrent_groups=4 \
+    +actor_rollout_ref.actor.thundersync.max_held_sources=8 \
+    +actor_rollout_ref.actor.thundersync.direct_when_group_bound=True \
+    +actor_rollout_ref.actor.thundersync.final_forest_max_tokens=16384 \
+    +actor_rollout_ref.actor.thundersync.binary_rewards=True \
     actor_rollout_ref.actor.loss_agg_mode=seq-mean-token-sum \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.actor.ppo_mini_batch_size="$BATCH" \
