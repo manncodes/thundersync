@@ -82,10 +82,10 @@ trained depends on the engine:
   `DataParallelThunderSync.step`.
 - Any other verl engine, such as VeOmni (`model_engine=veomni`) or FSDP,
   keeps its sharding and its sequence and expert parallelism. A group goes
-  through verl's own update pipeline as soon as its last trajectory lands
-  (padding to the data-parallel size, old and reference log-probs,
-  advantages), and the engine accumulates its forward-backward, normalized by
-  the whole batch. ThunderSync's reward-linear backward differentiates with
+  through verl's own update pipeline as soon as verl marks its rollout
+  finished, with every trajectory stored for it (padding to the
+  data-parallel size, old and reference log-probs, advantages), and the
+  engine accumulates its forward-backward, normalized by the whole batch. ThunderSync's reward-linear backward differentiates with
   `autograd.grad`, which bypasses a sharded engine's gradient reduction, so a
   sharded engine streams whole groups rather than single trajectories.
 
@@ -104,10 +104,21 @@ it too.
 The trainer refuses settings under which the streamed update differs from
 verl's one-update GRPO step (`CONTRACT` in
 `thundersync.integrations.verl.trainer`): one epoch, advantages that need only
-their own group, no dynamic sampling and no warmup batches. A sharded engine
-also refuses `loss_agg_mode=token-mean`, whose normalizer, the batch's token
-count, is unknown until the batch has landed. ThunderSync's engine also
-requires its objective's settings (`THUNDERSYNC_ENGINE_CONTRACT`).
+their own group, no dynamic sampling, no warmup batches, and rewards scored
+as each trajectory lands (no colocated reward model). A sharded engine also
+needs a `loss_agg_mode` it can normalize piece by piece
+(`STREAMED_LOSS_AGG_MODES`): not `token-mean`, whose normalizer, the batch's
+token count, is unknown until the batch has landed, and
+`seq-mean-token-sum-norm` only with `actor.loss_scale_factor` set.
+ThunderSync's engine also requires its objective's settings
+(`THUNDERSYNC_ENGINE_CONTRACT`), and stops the step on a group it cannot
+train: one that finishes short of `rollout.n` trajectories, or a session
+with more than one output.
+
+The `stream/` metrics report when the first piece was dispatched, when the
+last group landed, and the share of the batch dispatched before then.
+`+trainer.v1.thundersync.defer=True` holds every dispatch until the whole
+batch has landed: the same step without the overlap, for comparison.
 
 With `actor_rollout_ref.actor._target_` set to
 `thundersync.integrations.verl.engine.ThunderSyncActorConfig`, ThunderSync's

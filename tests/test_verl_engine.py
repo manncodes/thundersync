@@ -7,6 +7,8 @@
   chunking, whether content and reward land together or apart, under a
   held-source budget, on the direct path with the final forest, and with
   binary rewards;
+* build -- ``initialize`` builds ThunderSync's trainer from verl's configs
+  through ``load_trainer``, which registers the stream attention itself;
 * failure -- an error on the loop thread reaches the step that waits on it;
 * checkpoint -- a load restores the weights, optimizer and schedule, and
   re-arms the version guard the in-place load would otherwise trip;
@@ -21,6 +23,7 @@ and backward ``load_trainer`` builds. Skipped unless verl is importable.
 from __future__ import annotations
 
 import random
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -29,7 +32,9 @@ import torch.distributed as dist
 pytest.importorskip("verl")
 
 from transformers import AutoConfig, AutoModelForCausalLM  # noqa: E402
+from transformers.modeling_utils import AttentionInterface  # noqa: E402
 from verl.utils import tensordict_utils as tu  # noqa: E402
+from verl.workers.config import FSDPOptimizerConfig  # noqa: E402
 
 from thundersync.config import ConfigError  # noqa: E402
 from thundersync.engine.streaming import (  # noqa: E402
@@ -37,8 +42,10 @@ from thundersync.engine.streaming import (  # noqa: E402
     StreamingRun,
     register_stream_attention,
 )
+from thundersync.grpo import runtime  # noqa: E402
 from thundersync.grpo.data_parallel import DataParallelThunderSync  # noqa: E402
 from thundersync.grpo.reward_linear import RewardLinearBackward  # noqa: E402
+from thundersync.integrations.verl import engine as verl_engine  # noqa: E402
 from thundersync.integrations.verl.engine import (  # noqa: E402
     RankLoop,
     ThunderSyncEngine,
@@ -313,6 +320,45 @@ def test_work_claims_run_every_final_trajectory_through_the_store():
     for name, parameter in streamed.named_parameters():
         torch.testing.assert_close(parameter.grad, expected[name], rtol=2e-3, atol=1e-5, msg=name)
     assert report["done"] and report["offered"] > 0 and report["offered"] == report["own_claims"]
+
+
+def test_initialize_builds_the_trainer_from_verls_configs(monkeypatch):
+    # load_trainer on CPU, with stand-ins only for the checkpoint read and
+    # the NCCL trainer; nothing has registered the stream attention.
+    monkeypatch.delitem(AttentionInterface._global_mapping, STREAM_ATTENTION_NAME, raising=False)
+    monkeypatch.setattr(
+        runtime,
+        "load_policy_model",
+        lambda policy, device, attn_implementation: build_model(attn_implementation),
+    )
+    built = {}
+
+    def init_from_env(model, optimizer, **options):
+        built.update(options)
+        return LocalTrainer(model, optimizer)
+
+    monkeypatch.setattr(DataParallelThunderSync, "init_from_env", init_from_env)
+    monkeypatch.setattr(verl_engine, "get_device_name", lambda: "cpu")
+    monkeypatch.setattr(verl_engine, "get_device_id", lambda: 0)
+    engine = ThunderSyncEngine(
+        SimpleNamespace(lora_rank=0, local_path="model"),
+        SimpleNamespace(full_determinism=False, thundersync={"max_held_sources": 2}),
+        FSDPOptimizerConfig(lr=1e-2, betas=(0.8, 0.99), weight_decay=0.1, total_training_steps=4),
+        None,
+    )
+    engine.initialize()
+
+    assert engine.module.config._attn_implementation == STREAM_ATTENTION_NAME
+    assert built["source_offload_device"] == "cpu" and engine.loop._gates["max_held_sources"] == 2
+    (group,) = engine.optimizer.param_groups
+    assert (group["betas"], group["weight_decay"], group["maximize"]) == ((0.8, 0.99), 0.1, True)
+    before = [parameter.clone() for parameter in engine.module.parameters()]
+    engine.forward_backward_batch(batch(agent_loop_rows(groups=1, seed=0)))
+    engine.optimizer_step()
+    assert any(
+        not torch.equal(old, new)
+        for old, new in zip(before, engine.module.parameters(), strict=True)
+    )
 
 
 def test_an_error_on_the_loop_thread_reaches_the_step():

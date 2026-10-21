@@ -128,6 +128,9 @@ class ThunderSyncEngine(BaseEngine):
             "grad_clip": optim.clip_grad,
             "deterministic_algorithms": self.engine_config.full_determinism,
             "rebuild_block_tokens": 4096,
+            # DataParallelThunderSync's own default; "none" keeps sources on
+            # the device, which only the blocking mode allows.
+            "source_offload_device": "cpu",
         }
         settings = getattr(self.engine_config, "thundersync", {})
         config = grpo_config(verl_settings, settings)

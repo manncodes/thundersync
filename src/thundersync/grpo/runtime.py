@@ -8,7 +8,12 @@ from typing import Any
 
 import torch
 
-from thundersync.engine.streaming import STREAM_ATTENTION_NAME, StreamingRun, stream_attention_forward
+from thundersync.engine.streaming import (
+    STREAM_ATTENTION_NAME,
+    StreamingRun,
+    register_stream_attention,
+    stream_attention_forward,
+)
 from thundersync.grpo.config import GrpoTrainerConfig, StreamingTrainerConfig
 from thundersync.grpo.data_parallel import DataParallelThunderSync
 from thundersync.grpo.device_statistics import device_statistic_slots
@@ -162,6 +167,7 @@ def load_trainer(
 
     apply_trainer_determinism(config.policy.deterministic_algorithms)
 
+    register_stream_attention()
     attention_name = STREAM_ATTENTION_NAME
     source_run = (_GraphSourceStreamingRun
                   if config.streaming.source_attention_backend == "cudnn_graph" else StreamingRun)

@@ -4,15 +4,22 @@
   its group's rank once as a completion and once as a verdict, a completion
   stored before its reward goes ahead of it, a rank holds at most
   ``max_concurrent_groups`` groups open, and a fully scored group goes first;
-* groups -- with any other engine, each complete group goes through verl's
-  update pipeline once, groups that complete while a piece runs go together,
-  and every piece is normalized by the whole batch;
+* groups -- with any other engine, each group verl marks finished goes
+  through verl's update pipeline once with every trajectory stored for it,
+  groups that finish while a piece runs go together, and every piece is
+  normalized by the whole batch;
+* failure -- a failed group, or one ThunderSync's engine cannot train, stops
+  the step;
+* defer -- deferred, either stream dispatches once, after the whole batch has
+  landed, and reports nothing dispatched before;
 * content first -- the agent loop stores a trajectory's content before verl
   scores it;
 * contracts -- verl's defaults are refused key by key, every contract key
-  exists in verl's configuration, and the shipped launchers compose into
+  exists in verl's configuration, the shipped launchers compose into
   configurations verl and the contract accept, for ThunderSync's engine and
-  for VeOmni.
+  for VeOmni, another engine streams only losses it computes piece by piece
+  and rewards scored as trajectories land, and the worker takes whichever
+  role verl trains the actor under.
 
 Skipped unless verl and TransferQueue are importable.
 """
@@ -22,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import re
 import shlex
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,7 +42,7 @@ from hydra import compose, initialize_config_dir  # noqa: E402
 from omegaconf import OmegaConf  # noqa: E402
 from transfer_queue import KVBatchMeta  # noqa: E402
 from verl.experimental.agent_loop import AgentLoopOutput  # noqa: E402
-from verl.trainer.ppo.utils import need_critic, need_reference_policy  # noqa: E402
+from verl.trainer.ppo.utils import Role, need_critic, need_reference_policy  # noqa: E402
 from verl.utils.config import omega_conf_to_dataclass, validate_config  # noqa: E402
 
 from thundersync.config import ConfigError  # noqa: E402
@@ -60,8 +68,8 @@ class FakeQueue:
     def kv_list(self, partition_id):
         if self.landings:
             key, status = self.landings.pop(0)
-            self.tags[key] = {"status": status}
-        return {partition_id: dict(self.tags)}
+            self.tags.setdefault(key, {})["status"] = status
+        return {partition_id: {key: dict(tag) for key, tag in self.tags.items()}}
 
     def kv_clear(self, keys, partition_id):
         self.cleared += keys
@@ -91,11 +99,12 @@ class FakeWorkers:
         return SimpleNamespace(futures=[f"piece{len(self.pieces)}"])
 
 
-def step_on(monkeypatch, queue: FakeQueue, **thundersync):
+def step_on(monkeypatch, queue: FakeQueue, *, defer: bool = False, **thundersync):
     """A trainer on ``queue`` without its constructor (no workers, no Ray)."""
     monkeypatch.setattr(verl_trainer, "tq", queue)
     monkeypatch.setattr(verl_trainer, "POLL_INTERVAL_S", 0)
     trainer = object.__new__(verl_trainer.ThunderSyncTrainer)
+    trainer.defer = defer
     trainer.config = OmegaConf.create(
         {
             "data": {"train_batch_size": 3},
@@ -173,20 +182,42 @@ def test_a_completion_stored_before_its_reward_reaches_the_rank_first(monkeypatc
     assert first_call(0, "u0_1_0") == first_call(1, "u0_1_0")
 
 
-def test_a_failed_group_stops_the_step(monkeypatch):
-    queue = FakeQueue({"u0": "running", "u1": "failure"}, [("u0_0_0", "success")])
-    with pytest.raises(RuntimeError, match=r"rollout failed for groups \['u1'\]"):
+@pytest.mark.parametrize(
+    ("statuses", "landing", "error"),
+    [
+        (("running", "failure"), ("u0_0_0", "success"), r"rollout failed for groups \['u1'\]"),
+        (("finished", "running"), ("u0_0_0", "success"), r"groups \['u0'\] finished short"),
+        (("running", "running"), ("u0_0_1", "success"), "u0_0_1: not one of rollout.n=2"),
+        (("running", "running"), ("u0_2_0", "content"), "u0_2_0: not one of rollout.n=2"),
+    ],
+)
+def test_a_group_that_failed_or_that_thundersync_cannot_train_stops_the_step(
+    monkeypatch, statuses, landing, error
+):
+    queue = FakeQueue(dict(zip(("u0", "u1"), statuses, strict=True)), [landing])
+    with pytest.raises(RuntimeError, match=error):
         step_on(monkeypatch, queue)._stream_trajectories(2, {})
 
 
-def test_complete_groups_accumulate_once_and_wait_for_the_running_piece(monkeypatch):
-    # u0 completes first; u2 and then u1 complete while its piece runs.
-    order = ["u0_0_0", "u1_0_0", "u0_1_0", "u2_0_0", "u2_1_0", "u1_1_0"]
-    queue = FakeQueue(
-        dict.fromkeys(["u0", "u1", "u2"], "running"), [(key, "success") for key in order]
+def test_finished_groups_accumulate_once_and_wait_for_the_running_piece(monkeypatch):
+    # u0 finishes first, with two outputs in its second session; u2 and then
+    # u1 finish while its piece runs.
+    landings = [
+        ("u0_0_0", "success"),
+        ("u1_0_0", "success"),
+        ("u0_1_0", "success"),
+        ("u0_1_1", "success"),
+        ("u0", "finished"),
+        ("u2_0_0", "success"),
+        ("u2_1_0", "success"),
+        ("u2", "finished"),
+        ("u1_1_0", "success"),
+        ("u1", "finished"),
+    ]
+    trainer = step_on(
+        monkeypatch, FakeQueue(dict.fromkeys(["u0", "u1", "u2"], "running"), landings)
     )
-    trainer = step_on(monkeypatch, queue)
-    polls_running = iter([1, 1, 1, 0])
+    polls_running = iter([1, 1, 1, 1, 0])
     monkeypatch.setattr(
         verl_trainer.ray,
         "wait",
@@ -201,9 +232,34 @@ def test_complete_groups_accumulate_once_and_wait_for_the_running_piece(monkeypa
     trainer._accumulate = accumulate
     batch, futures = trainer._stream_groups(3, {})
 
-    assert accumulated == [["u0_0_0", "u0_1_0"], ["u2_0_0", "u2_1_0", "u1_0_0", "u1_1_0"]]
+    assert accumulated == [
+        ["u0_0_0", "u0_1_0", "u0_1_1"],
+        ["u2_0_0", "u2_1_0", "u1_0_0", "u1_1_0"],
+    ]
     assert trainer.actor_rollout_wg.pieces == accumulated
-    assert futures == ["piece1", "piece2"] and sorted(batch.keys) == sorted(order)
+    assert futures == ["piece1", "piece2"]
+    assert sorted(batch.keys) == sorted(key for key, _ in landings if "_" in key)
+
+
+@pytest.mark.parametrize("defer", [False, True])
+@pytest.mark.parametrize("stream", ["_stream_trajectories", "_stream_groups"])
+def test_deferring_dispatches_once_the_whole_batch_has_landed(monkeypatch, stream, defer):
+    landings = [(f"u{group}_{session}_0", "success") for group in (0, 1) for session in (0, 1)]
+    landings[2:2] = [("u0", "finished")]
+    landings.append(("u1", "finished"))
+    queue = FakeQueue(dict.fromkeys(["u0", "u1"], "running"), landings)
+    trainer = step_on(monkeypatch, queue, defer=defer)
+    trainer._accumulate = lambda keys, tags, aggregator: KVBatchMeta(
+        partition_id="train", keys=keys, tags=tags
+    )
+    monkeypatch.setattr(verl_trainer.ray, "wait", lambda refs, num_returns, timeout: (refs, []))
+    metrics = {}
+    getattr(trainer, stream)(2, metrics)
+
+    workers = trainer.actor_rollout_wg
+    dispatches = workers.lands if stream == "_stream_trajectories" else workers.pieces
+    assert (len(dispatches) == 1) == defer
+    assert (metrics["stream/dispatched_before_last_landing"] == 0) == defer
 
 
 def test_a_piece_runs_verls_pipeline_and_is_normalized_by_the_whole_batch(monkeypatch):
@@ -306,8 +362,44 @@ def test_the_launchers_compose_into_accepted_configurations(script, actor_config
     assert type(omega_conf_to_dataclass(config.actor_rollout_ref.actor)).__name__ == actor_config
 
 
-def test_streaming_groups_refuses_token_mean():
+LOSS_AGG_MODE = "actor_rollout_ref.actor.loss_agg_mode"
+REWARD_MODEL = "reward.reward_model"
+
+
+@pytest.mark.parametrize(
+    ("overrides", "accepted"),
+    [
+        ({LOSS_AGG_MODE: "token-mean"}, False),
+        ({LOSS_AGG_MODE: "seq-mean-token-sum-norm"}, False),
+        (
+            {
+                LOSS_AGG_MODE: "seq-mean-token-sum-norm",
+                "actor_rollout_ref.actor.loss_scale_factor": 1024,
+            },
+            True,
+        ),
+        ({LOSS_AGG_MODE: "token-sum"}, True),
+        ({f"{REWARD_MODEL}.enable": True}, False),
+        ({f"{REWARD_MODEL}.enable": True, f"{REWARD_MODEL}.enable_resource_pool": True}, True),
+    ],
+)
+def test_another_engine_streams_what_it_computes_piece_by_piece(overrides, accepted):
     config = launcher_config("verl_grpo_veomni.sh")
-    config.actor_rollout_ref.actor.loss_agg_mode = "token-mean"
-    with pytest.raises(ConfigError, match="token-mean"):
+    for key, value in overrides.items():
+        OmegaConf.update(config, key, value)
+    with nullcontext() if accepted else pytest.raises(ConfigError):
         verl_trainer.check_contract(config)
+
+
+@pytest.mark.parametrize("role", [Role.Actor, Role.ActorRolloutRef, Role.ActorRollout])
+def test_the_worker_takes_the_role_verl_trains_the_actor_under(monkeypatch, role):
+    def verls(self):
+        self.role_worker_mapping = {role: "verl", Role.RefPolicy: "verl"}
+
+    monkeypatch.setattr(verl_trainer.PPOTrainerSeparateAsync, "_init_resource_pool_mgr", verls)
+    trainer = object.__new__(verl_trainer.ThunderSyncTrainer)
+    trainer._init_resource_pool_mgr()
+
+    mapping = trainer.role_worker_mapping
+    assert mapping[role].__ray_actor_class__ is verl_trainer.ThunderSyncWorker
+    assert mapping[Role.RefPolicy] == "verl"
